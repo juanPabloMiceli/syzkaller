@@ -33,10 +33,9 @@ type Config struct {
 }
 
 type Pool struct {
-	count   int
-	env     *vmimpl.Env
-	cfg     *Config
-	version string
+	count int
+	env   *vmimpl.Env
+	cfg   *Config
 }
 
 type instance struct {
@@ -60,12 +59,6 @@ type instance struct {
 	diagnose         chan bool
 }
 
-func getFuchsiaVersion(fuchsiaDirectory string) ([]byte, error) {
-	cmd := osutil.Command("ffx", "version")
-	cmd.Dir = fuchsiaDirectory
-	return cmd.Output()
-}
-
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	cfg := &Config{}
 	if err := config.LoadData(env.Config, cfg); err != nil {
@@ -77,16 +70,11 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	if !osutil.IsDir(cfg.Fuchsia) {
 		return nil, fmt.Errorf("%q is not a directory", cfg.Fuchsia)
 	}
-	version, err := getFuchsiaVersion(cfg.Fuchsia)
-	if err != nil {
-		return nil, fmt.Errorf("There is an error running ffx commands in the Fuchsia checkout (%q): %v", cfg.Fuchsia, err)
-	}
 
 	pool := &Pool{
-		count:   cfg.Count,
-		env:     env,
-		cfg:     cfg,
-		version: string(version),
+		count: cfg.Count,
+		env:   env,
+		cfg:   cfg,
 	}
 	return pool, nil
 }
@@ -110,7 +98,6 @@ func (pool *Pool) ctor(workdir string, index int) (vmimpl.Instance, error) {
 		workdir:          workdir,
 		// This file is auto-generated inside createAdbScript
 		executor: filepath.Join(workdir, "adb_executor.sh"),
-		version:  pool.version,
 	}
 	closeInst := inst
 	defer func() {
@@ -137,7 +124,7 @@ func (inst *instance) terminateFuchsiaVm() {
 	if inst.debug {
 		log.Logf(0, "Terminating Fuchsia VM: %v", inst.name)
 	}
-	inst.runCommand("ffx", "emu", "stop", inst.name)
+	inst.runCommand("ffx", "--isolate-dir", inst.workdir, "emu", "stop", inst.name)
 }
 
 func (inst *instance) Close() {
@@ -164,7 +151,7 @@ func (inst *instance) Close() {
 }
 
 func (inst *instance) startFuchsiaVm() error {
-	ffxArgs := []string{"ffx", "emu", "start", "--headless", "--name", inst.name}
+	ffxArgs := []string{"ffx", "--isolate-dir", inst.workdir, "emu", "start", "--headless", "--name", inst.name}
 	inst.args = ffxArgs[3:]
 	_, err := inst.runCommand(ffxArgs...)
 	if err != nil {
@@ -175,16 +162,25 @@ func (inst *instance) startFuchsiaVm() error {
 }
 
 func (inst *instance) startFuchsiaLogs() (*exec.Cmd, error) {
-	cmd := osutil.Command("ffx", "--target", inst.name, "log")
+	cmd := osutil.Command("ffx", "--target", inst.name, "--isolate-dir", inst.workdir, "log")
 	cmd.Dir = inst.fuchsiaDirectory
-	cmd.Stdout = inst.wpipe
-	cmd.Stderr = inst.wpipe
-	inst.merger.Add("fuchsia", inst.rpipe)
+
+	// open the out file for writing
+	outfile, err := os.Create(filepath.Join(inst.workdir, "logs.out"))
+	if err != nil {
+		panic(err)
+	}
+	defer outfile.Close()
+	cmd.Stdout = outfile
+	cmd.Stderr = outfile
+	//	cmd.Stdout = inst.wpipe
+	//	cmd.Stderr = inst.wpipe
+	//	inst.merger.Add("fuchsia", inst.rpipe)
 	return cmd, cmd.Start()
 }
 
 func (inst *instance) startAdbServerAndConnection(timeout time.Duration) error {
-	cmd := osutil.Command("ffx", "--target", inst.name, "starnix", "adb", "-p", fmt.Sprintf("%d", inst.port))
+	cmd := osutil.Command("ffx", "--target", inst.name, "--isolate-dir", inst.workdir, "starnix", "adb", "-p", fmt.Sprintf("%d", inst.port))
 	cmd.Dir = inst.fuchsiaDirectory
 	if err := cmd.Start(); err != nil {
 		return err
@@ -231,6 +227,26 @@ func (inst *instance) createAdbScript() error {
 	return os.WriteFile(inst.executor, []byte(adbScript), 0777)
 }
 
+func (inst *instance) setFuchsiaVersion() error {
+	cmd := osutil.Command("ffx", "--isolate-dir", inst.workdir, "version")
+	cmd.Dir = inst.fuchsiaDirectory
+	version, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("There is an error running ffx commands in the Fuchsia checkout (%q): %v", inst.fuchsiaDirectory, err)
+	}
+	inst.version = string(version)
+	return nil
+}
+
+func (inst *instance) enableStarnix() error {
+	cmd := osutil.Command("ffx", "--isolate-dir", inst.workdir, "config", "set", "starnix_enabled", "true")
+	cmd.Dir = inst.fuchsiaDirectory
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (inst *instance) boot() error {
 	inst.port = vmimpl.UnusedTCPPort()
 	// Start output merger.
@@ -240,23 +256,31 @@ func (inst *instance) boot() error {
 	}
 	inst.merger = vmimpl.NewOutputMerger(tee)
 
+	if err := inst.setFuchsiaVersion(); err != nil {
+		return err
+	}
+
+	if err := inst.enableStarnix(); err != nil {
+		return fmt.Errorf("Could not enable starnix: %v", err)
+	}
+
 	inst.terminateFuchsiaVm()
 
 	if err := inst.startFuchsiaVm(); err != nil {
-		return err
+		return fmt.Errorf("Could not start Fuchsia VM: %v", err)
 	}
 
 	if err := inst.startAdbServerAndConnection(1 * time.Minute * inst.timeouts.Scale); err != nil {
-		return err
+		return fmt.Errorf("Could not start and connect to the adb server: %v", err)
 	}
 
 	if err := inst.createAdbScript(); err != nil {
-		return err
+		return fmt.Errorf("Could not create adb script: %v", err)
 	}
 
 	cmd, err := inst.startFuchsiaLogs()
 	if err != nil {
-		return err
+		return fmt.Errorf("Could not start fuchsia logs: %v", err)
 	}
 	inst.fuchsiaLogs = cmd
 	if inst.debug {
